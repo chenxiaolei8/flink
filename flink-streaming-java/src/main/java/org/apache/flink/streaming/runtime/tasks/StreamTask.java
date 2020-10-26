@@ -74,6 +74,7 @@ import org.apache.flink.streaming.runtime.tasks.mailbox.TaskMailbox;
 import org.apache.flink.streaming.runtime.tasks.mailbox.TaskMailboxImpl;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.FlinkException;
+import org.apache.flink.util.InstantiationUtil;
 import org.apache.flink.util.Preconditions;
 import org.apache.flink.util.SerializedValue;
 import org.apache.flink.util.function.RunnableWithException;
@@ -87,7 +88,6 @@ import javax.annotation.Nullable;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
 import java.util.OptionalLong;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CompletionException;
@@ -543,15 +543,16 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 
 			afterInvoke();
 		}
-		catch (Exception invokeException) {
+		catch (Throwable invokeException) {
 			failing = !canceled;
 			try {
 				cleanUpInvoke();
 			}
 			catch (Throwable cleanUpException) {
-				throw (Exception) ExceptionUtils.firstOrSuppressed(cleanUpException, invokeException);
+				Throwable throwable = ExceptionUtils.firstOrSuppressed(cleanUpException, invokeException);
+				ExceptionUtils.rethrowException(throwable);
 			}
-			throw invokeException;
+			ExceptionUtils.rethrowException(invokeException);
 		}
 		cleanUpInvoke();
 	}
@@ -1144,7 +1145,6 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 			Environment environment) {
 		List<RecordWriter<SerializationDelegate<StreamRecord<OUT>>>> recordWriters = new ArrayList<>();
 		List<StreamEdge> outEdgesInOrder = configuration.getOutEdgesInOrder(environment.getUserClassLoader());
-		Map<Integer, StreamConfig> chainedConfigs = configuration.getTransitiveChainedTaskConfigsWithSelf(environment.getUserClassLoader());
 
 		for (int i = 0; i < outEdgesInOrder.size(); i++) {
 			StreamEdge edge = outEdgesInOrder.get(i);
@@ -1154,19 +1154,30 @@ public abstract class StreamTask<OUT, OP extends StreamOperator<OUT>>
 					i,
 					environment,
 					environment.getTaskInfo().getTaskName(),
-					chainedConfigs.get(edge.getSourceId()).getBufferTimeout()));
+					edge.getBufferTimeout()));
 		}
 		return recordWriters;
 	}
 
+	@SuppressWarnings("unchecked")
 	private static <OUT> RecordWriter<SerializationDelegate<StreamRecord<OUT>>> createRecordWriter(
 			StreamEdge edge,
 			int outputIndex,
 			Environment environment,
 			String taskName,
 			long bufferTimeout) {
-		@SuppressWarnings("unchecked")
-		StreamPartitioner<OUT> outputPartitioner = (StreamPartitioner<OUT>) edge.getPartitioner();
+
+		StreamPartitioner<OUT> outputPartitioner = null;
+
+		// Clones the partition to avoid multiple stream edges sharing the same stream partitioner,
+		// like the case of https://issues.apache.org/jira/browse/FLINK-14087.
+		try {
+			outputPartitioner = InstantiationUtil.clone(
+				(StreamPartitioner<OUT>) edge.getPartitioner(),
+				environment.getUserClassLoader());
+		} catch (Exception e) {
+			ExceptionUtils.rethrow(e);
+		}
 
 		LOG.debug("Using partitioner {} for output {} of task {}", outputPartitioner, outputIndex, taskName);
 

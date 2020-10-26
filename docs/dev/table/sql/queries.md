@@ -63,7 +63,7 @@ final Schema schema = new Schema()
     .field("product", DataTypes.STRING())
     .field("amount", DataTypes.INT());
 
-tableEnv.connect(new FileSystem("/path/to/file"))
+tableEnv.connect(new FileSystem().path("/path/to/file"))
     .withFormat(...)
     .withSchema(schema)
     .createTemporaryTable("RubberOrders");
@@ -99,7 +99,7 @@ val schema = new Schema()
     .field("product", DataTypes.STRING())
     .field("amount", DataTypes.INT())
 
-tableEnv.connect(new FileSystem("/path/to/file"))
+tableEnv.connect(new FileSystem().path("/path/to/file"))
     .withFormat(...)
     .withSchema(schema)
     .createTemporaryTable("RubberOrders")
@@ -664,14 +664,14 @@ FROM Orders CROSS JOIN UNNEST(tags) AS t (tag)
         <p>A row of the left (outer) table is dropped, if its table function call returns an empty result.</p>
 {% highlight sql %}
 SELECT users, tag
-FROM Orders, LATERAL TABLE(unnest_udtf(tags)) t AS tag
+FROM Orders, LATERAL TABLE(unnest_udtf(tags)) AS t(tag)
 {% endhighlight %}
 
         <p><b>Left Outer Join</b></p>
         <p>If a table function call returns an empty result, the corresponding outer row is preserved and the result padded with null values.</p>
 {% highlight sql %}
 SELECT users, tag
-FROM Orders LEFT JOIN LATERAL TABLE(unnest_udtf(tags)) t AS tag ON TRUE
+FROM Orders LEFT JOIN LATERAL TABLE(unnest_udtf(tags)) AS t(tag) ON TRUE
 {% endhighlight %}
 
         <p><b>Note:</b> Currently, only literal <code>TRUE</code> is supported as predicate for a left outer join against a lateral table.</p>

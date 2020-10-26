@@ -62,6 +62,7 @@ import org.apache.flink.runtime.util.SignalHandler;
 import org.apache.flink.util.AutoCloseableAsync;
 import org.apache.flink.util.ExceptionUtils;
 import org.apache.flink.util.ExecutorUtils;
+import org.apache.flink.util.FlinkException;
 import org.apache.flink.util.TaskManagerExceptionUtils;
 
 import org.slf4j.Logger;
@@ -77,6 +78,7 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 
+import static org.apache.flink.runtime.security.ExitTrappingSecurityManager.replaceGracefulExitWithHaltIfConfigured;
 import static org.apache.flink.util.Preconditions.checkNotNull;
 
 /**
@@ -113,13 +115,13 @@ public class TaskManagerRunner implements FatalErrorHandler, AutoCloseableAsync 
 	/** Executor used to run future callbacks. */
 	private final ExecutorService executor;
 
-	private final TaskExecutor taskManager;
+	private final TaskExecutorService taskExecutorService;
 
 	private final CompletableFuture<Void> terminationFuture;
 
 	private boolean shutdown;
 
-	public TaskManagerRunner(Configuration configuration, ResourceID resourceId, PluginManager pluginManager) throws Exception {
+	public TaskManagerRunner(Configuration configuration, ResourceID resourceId, PluginManager pluginManager, TaskExecutorServiceFactory taskExecutorServiceFactory) throws Exception {
 		this.configuration = checkNotNull(configuration);
 		this.resourceId = checkNotNull(resourceId);
 
@@ -154,7 +156,7 @@ public class TaskManagerRunner implements FatalErrorHandler, AutoCloseableAsync 
 				ExternalResourceUtils.getExternalResourceAmountMap(configuration),
 				ExternalResourceUtils.externalResourceDriversFromConfig(configuration, pluginManager));
 
-		taskManager = startTaskManager(
+		taskExecutorService = taskExecutorServiceFactory.createTaskExecutor(
 			this.configuration,
 			this.resourceId,
 			rpcService,
@@ -168,8 +170,19 @@ public class TaskManagerRunner implements FatalErrorHandler, AutoCloseableAsync 
 
 		this.terminationFuture = new CompletableFuture<>();
 		this.shutdown = false;
+		handleUnexpectedTaskExecutorServiceTermination();
 
 		MemoryLogger.startIfConfigured(LOG, configuration, terminationFuture);
+	}
+
+	private void handleUnexpectedTaskExecutorServiceTermination() {
+		taskExecutorService.getTerminationFuture().whenComplete((unused, throwable) -> {
+			synchronized (lock) {
+				if (!shutdown) {
+					onFatalError(new FlinkException("Unexpected termination of the TaskExecutor.", throwable));
+				}
+			}
+		});
 	}
 
 	// --------------------------------------------------------------------------------------------
@@ -177,7 +190,7 @@ public class TaskManagerRunner implements FatalErrorHandler, AutoCloseableAsync 
 	// --------------------------------------------------------------------------------------------
 
 	public void start() throws Exception {
-		taskManager.start();
+		taskExecutorService.start();
 	}
 
 	@Override
@@ -186,7 +199,7 @@ public class TaskManagerRunner implements FatalErrorHandler, AutoCloseableAsync 
 			if (!shutdown) {
 				shutdown = true;
 
-				final CompletableFuture<Void> taskManagerTerminationFuture = taskManager.closeAsync();
+				final CompletableFuture<Void> taskManagerTerminationFuture = taskExecutorService.closeAsync();
 
 				final CompletableFuture<Void> serviceTerminationFuture = FutureUtils.composeAfterwards(
 					taskManagerTerminationFuture,
@@ -302,24 +315,15 @@ public class TaskManagerRunner implements FatalErrorHandler, AutoCloseableAsync 
 	}
 
 	public static void runTaskManager(Configuration configuration, ResourceID resourceId, PluginManager pluginManager) throws Exception {
-		final TaskManagerRunner taskManagerRunner = new TaskManagerRunner(configuration, resourceId, pluginManager);
+		final TaskManagerRunner taskManagerRunner = new TaskManagerRunner(configuration, resourceId, pluginManager, TaskManagerRunner::createTaskExecutorService);
 
 		taskManagerRunner.start();
 	}
 
 	public static void runTaskManagerSecurely(String[] args, ResourceID resourceID) {
 		try {
-			final Configuration configuration = loadConfiguration(args);
-
-			final PluginManager pluginManager = PluginUtils.createPluginManagerFromRootFolder(configuration);
-			FileSystem.initialize(configuration, pluginManager);
-
-			SecurityUtils.install(new SecurityConfiguration(configuration));
-
-			SecurityUtils.getInstalledContext().runSecured(() -> {
-				runTaskManager(configuration, resourceID, pluginManager);
-				return null;
-			});
+			Configuration configuration = loadConfiguration(args);
+			runTaskManagerSecurely(configuration, resourceID);
 		} catch (Throwable t) {
 			final Throwable strippedThrowable = ExceptionUtils.stripException(t, UndeclaredThrowableException.class);
 			LOG.error("TaskManager initialization failed.", strippedThrowable);
@@ -327,9 +331,49 @@ public class TaskManagerRunner implements FatalErrorHandler, AutoCloseableAsync 
 		}
 	}
 
+	public static void runTaskManagerSecurely(Configuration configuration, ResourceID resourceID) throws Exception {
+		replaceGracefulExitWithHaltIfConfigured(configuration);
+		final PluginManager pluginManager = PluginUtils.createPluginManagerFromRootFolder(configuration);
+		FileSystem.initialize(configuration, pluginManager);
+
+		SecurityUtils.install(new SecurityConfiguration(configuration));
+
+		SecurityUtils.getInstalledContext().runSecured(() -> {
+			runTaskManager(configuration, resourceID, pluginManager);
+			return null;
+		});
+	}
+
 	// --------------------------------------------------------------------------------------------
 	//  Static utilities
 	// --------------------------------------------------------------------------------------------
+
+	public static TaskExecutorService createTaskExecutorService(
+			Configuration configuration,
+			ResourceID resourceID,
+			RpcService rpcService,
+			HighAvailabilityServices highAvailabilityServices,
+			HeartbeatServices heartbeatServices,
+			MetricRegistry metricRegistry,
+			BlobCacheService blobCacheService,
+			boolean localCommunicationOnly,
+			ExternalResourceInfoProvider externalResourceInfoProvider,
+			FatalErrorHandler fatalErrorHandler) throws Exception {
+
+		final TaskExecutor taskExecutor = startTaskManager(
+				configuration,
+				resourceID,
+				rpcService,
+				highAvailabilityServices,
+				heartbeatServices,
+				metricRegistry,
+				blobCacheService,
+				localCommunicationOnly,
+				externalResourceInfoProvider,
+				fatalErrorHandler);
+
+		return TaskExecutorToServiceAdapter.createFor(taskExecutor);
+	}
 
 	public static TaskExecutor startTaskManager(
 			Configuration configuration,
@@ -458,5 +502,28 @@ public class TaskManagerRunner implements FatalErrorHandler, AutoCloseableAsync 
 
 		HostBindPolicy bindPolicy = HostBindPolicy.fromString(configuration.getString(TaskManagerOptions.HOST_BIND_POLICY));
 		return bindPolicy == HostBindPolicy.IP ? taskManagerAddress.getHostAddress() : taskManagerAddress.getHostName();
+	}
+
+	/**
+	 * Factory for {@link TaskExecutor}.
+	 */
+	public interface TaskExecutorServiceFactory {
+		TaskExecutorService createTaskExecutor(
+				Configuration configuration,
+				ResourceID resourceID,
+				RpcService rpcService,
+				HighAvailabilityServices highAvailabilityServices,
+				HeartbeatServices heartbeatServices,
+				MetricRegistry metricRegistry,
+				BlobCacheService blobCacheService,
+				boolean localCommunicationOnly,
+				ExternalResourceInfoProvider externalResourceInfoProvider,
+				FatalErrorHandler fatalErrorHandler) throws Exception;
+	}
+
+	public interface TaskExecutorService extends AutoCloseableAsync {
+		void start();
+
+		CompletableFuture<Void> getTerminationFuture();
 	}
 }
